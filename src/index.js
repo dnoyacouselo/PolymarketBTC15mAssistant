@@ -25,6 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
+import { collectSnapshot, buildCollectorData, startOutcomeChecker } from "./backtest/collector.js";
 
 function countVwapCrosses(closes, vwapSeries, lookback) {
   if (closes.length < lookback || vwapSeries.length < lookback) return null;
@@ -400,6 +401,10 @@ async function main() {
   const polymarketLiveStream = startPolymarketChainlinkPriceStream({});
   const chainlinkStream = startChainlinkPriceStream({});
 
+  // Iniciar el checker de outcomes para resolver mercados pasados
+  let lastChainlinkPrice = null;
+  startOutcomeChecker(() => lastChainlinkPrice, 60_000);
+
   let prevSpotPrice = null;
   let prevCurrentPrice = null;
   let priceToBeatState = { slug: null, value: null, setAtMs: null };
@@ -705,6 +710,34 @@ async function main() {
 
       prevSpotPrice = spotPrice ?? prevSpotPrice;
       prevCurrentPrice = currentPrice ?? prevCurrentPrice;
+      lastChainlinkPrice = currentPrice ?? lastChainlinkPrice;
+
+      // Recolectar snapshot para backtesting
+      try {
+        const collectorData = buildCollectorData({
+          poly,
+          chainlinkPrice: currentPrice,
+          binancePrice: spotPrice,
+          priceToBeat,
+          rsiNow,
+          rsiSlope,
+          macd,
+          vwapNow,
+          vwapSlope,
+          vwapDist,
+          consec,
+          delta1m,
+          delta3m,
+          regimeInfo,
+          timeAware,
+          edge,
+          rec,
+          timeLeftMin
+        });
+        collectSnapshot(collectorData);
+      } catch {
+        // Silenciar errores del collector para no interrumpir el loop
+      }
 
       appendCsvRow("./logs/signals.csv", header, [
         new Date().toISOString(),

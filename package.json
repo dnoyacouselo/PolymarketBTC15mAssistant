@@ -1,12 +1,19 @@
 {
   "name": "polyassistent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "backtest": "node src/backtest/cli.js backtest",
+    "backtest:stats": "node src/backtest/cli.js stats",
+    "backtest:markets": "node src/backtest/cli.js markets",
+    "backtest:optimize": "node src/backtest/cli.js optimize",
+    "backtest:export": "node src/backtest/cli.js export",
+    "backtest:help": "node src/backtest/cli.js help"
   },
   "dependencies": {
+    "better-sqlite3": "^11.7.0",
     "ethers": "^6.11.1",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",
