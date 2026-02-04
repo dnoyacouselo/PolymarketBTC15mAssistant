@@ -20,12 +20,15 @@ export function computeEdge({ modelUp, modelDown, marketYes, marketNo }) {
   };
 }
 
-export function decide({ remainingMinutes, edgeUp, edgeDown, modelUp = null, modelDown = null }) {
+export function decide({ remainingMinutes, edgeUp, edgeDown, modelUp = null, modelDown = null, regime = null }) {
   const phase = remainingMinutes > 10 ? "EARLY" : remainingMinutes > 5 ? "MID" : "LATE";
 
-  const threshold = phase === "EARLY" ? 0.05 : phase === "MID" ? 0.1 : 0.2;
+  // Umbrales ajustados basados en backtesting de 45+ horas
+  // GOOD tuvo 62.5% precision, STRONG solo 36.7%
+  const threshold = phase === "EARLY" ? 0.08 : phase === "MID" ? 0.12 : 0.2;
 
-  const minProb = phase === "EARLY" ? 0.55 : phase === "MID" ? 0.6 : 0.65;
+  // Probabilidad minima mas estricta
+  const minProb = phase === "EARLY" ? 0.60 : phase === "MID" ? 0.65 : 0.70;
 
   if (edgeUp === null || edgeDown === null) {
     return { action: "NO_TRADE", side: null, phase, reason: "missing_market_data" };
@@ -35,6 +38,15 @@ export function decide({ remainingMinutes, edgeUp, edgeDown, modelUp = null, mod
   const bestEdge = bestSide === "UP" ? edgeUp : edgeDown;
   const bestModel = bestSide === "UP" ? modelUp : modelDown;
 
+  // FILTRO CRITICO: Votos UP en TREND_UP tuvieron solo 35% precision
+  // Requerir edge mucho mayor para esta combinacion
+  if (bestSide === "UP" && regime === "TREND_UP") {
+    const upInTrendThreshold = 0.25; // Mucho mas estricto
+    if (bestEdge < upInTrendThreshold) {
+      return { action: "NO_TRADE", side: null, phase, reason: "up_in_trend_up_filtered" };
+    }
+  }
+
   if (bestEdge < threshold) {
     return { action: "NO_TRADE", side: null, phase, reason: `edge_below_${threshold}` };
   }
@@ -43,6 +55,11 @@ export function decide({ remainingMinutes, edgeUp, edgeDown, modelUp = null, mod
     return { action: "NO_TRADE", side: null, phase, reason: `prob_below_${minProb}` };
   }
 
-  const strength = bestEdge >= 0.2 ? "STRONG" : bestEdge >= 0.1 ? "GOOD" : "OPTIONAL";
+  // STRONG ahora requiere edge >= 0.30 Y probabilidad >= 0.75
+  // Esto evita los falsos positivos que tenian 36.7% precision
+  const isStrong = bestEdge >= 0.30 && bestModel !== null && bestModel >= 0.75;
+  const isGood = bestEdge >= 0.12;
+  
+  const strength = isStrong ? "STRONG" : isGood ? "GOOD" : "OPTIONAL";
   return { action: "ENTER", side: bestSide, phase, strength, edge: bestEdge };
 }

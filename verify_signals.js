@@ -10,7 +10,7 @@ const CONFIG = {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const logFile = path.join(__dirname, 'logs', 'signals.csv');
+const logFile = path.join(__dirname, 'signals.csv');
 
 // 1. Read Signals
 if (!fs.existsSync(logFile)) {
