@@ -13,9 +13,11 @@ import {
   summarizeOrderBook
 } from "./data/polymarket.js";
 import { computeSessionVwap, computeVwapSeries } from "./indicators/vwap.js";
-import { computeRsi, sma, slopeLast } from "./indicators/rsi.js";
+import { computeRsi, sma, slopeLast, detectRsiDivergence } from "./indicators/rsi.js";
 import { computeMacd } from "./indicators/macd.js";
 import { computeHeikenAshi, countConsecutive } from "./indicators/heikenAshi.js";
+import { detectVolumeSpike, computeVolumePressure } from "./indicators/volume.js";
+import { analyzePolymarketBook } from "./indicators/orderbook.js";
 import { detectRegime } from "./engines/regime.js";
 import { scoreDirection, applyTimeAwareness } from "./engines/probability.js";
 import { computeEdge, decide } from "./engines/edge.js";
@@ -490,6 +492,11 @@ async function main() {
         ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
         : false;
 
+      // --- Nuevos indicadores leading ---
+      const divergence = detectRsiDivergence(closes, rsiSeries, 20);
+      const volSpike = detectVolumeSpike(candles, 60, 2.0);
+      const volPressure = computeVolumePressure(candles, 20);
+
       const regimeInfo = detectRegime({
         price: lastPrice,
         vwap: vwapNow,
@@ -499,7 +506,19 @@ async function main() {
         volumeAvg
       });
 
+      const marketUp = poly.ok ? poly.prices.up : null;
+      const marketDown = poly.ok ? poly.prices.down : null;
+
+      const polyBook = analyzePolymarketBook({
+        marketUp,
+        marketDown,
+        upBook: poly.ok ? poly.orderbook.up : null,
+        downBook: poly.ok ? poly.orderbook.down : null
+      });
+
+      // --- Scoring adaptativo por regimen ---
       const scored = scoreDirection({
+        regime: regimeInfo.regime,
         price: lastPrice,
         vwap: vwapNow,
         vwapSlope,
@@ -508,16 +527,27 @@ async function main() {
         macd,
         heikenColor: consec.color,
         heikenCount: consec.count,
-        failedVwapReclaim
+        failedVwapReclaim,
+        divergence,
+        volumeSpike: volSpike,
+        volumePressure: volPressure,
+        polymarketBook: polyBook
       });
 
       const timeAware = applyTimeAwareness(scored.rawUp, timeLeftMin, CONFIG.candleWindowMinutes);
 
-      const marketUp = poly.ok ? poly.prices.up : null;
-      const marketDown = poly.ok ? poly.prices.down : null;
       const edge = computeEdge({ modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, marketYes: marketUp, marketNo: marketDown });
 
-      const rec = decide({ remainingMinutes: timeLeftMin, edgeUp: edge.edgeUp, edgeDown: edge.edgeDown, modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, regime: regimeInfo.regime });
+      // --- Decision mejorada con filtros de agreement y divergencia ---
+      const rec = decide({
+        remainingMinutes: timeLeftMin,
+        edgeUp: edge.edgeUp,
+        edgeDown: edge.edgeDown,
+        modelUp: timeAware.adjustedUp,
+        modelDown: timeAware.adjustedDown,
+        regime: regimeInfo.regime,
+        signals: scored.signals
+      });
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
 
