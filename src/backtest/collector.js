@@ -12,7 +12,7 @@ let outcomeCheckInterval = null;
  * Recolecta un snapshot del estado actual del mercado y señales.
  * Llamar esto en cada iteración del loop principal.
  */
-export function collectSnapshot(data) {
+export async function collectSnapshot(data) {
   const {
     // Mercado
     market,
@@ -97,17 +97,17 @@ export function collectSnapshot(data) {
   };
 
   try {
-    insertSnapshot(snapshot);
+    await insertSnapshot(snapshot);
     
     // Detectar cambio de mercado para resolver outcomes pendientes
     if (marketSlug && marketSlug !== lastCollectedSlug) {
       lastCollectedSlug = marketSlug;
       // Chequear outcomes pendientes cuando cambia el mercado
-      checkPendingOutcomes(chainlinkPrice);
+      // No awaiting here to avoid blocking main loop too much if DB is slow?
+      // Actually await is fine as sqlite3 in WAL mode is fast.
+      checkPendingOutcomes(chainlinkPrice).catch(e => console.error(e));
     }
   } catch (err) {
-    // Silenciar errores para no interrumpir el loop principal
-    // pero loggear para debugging
     if (process.env.DEBUG_COLLECTOR) {
       console.error("[Collector] Error inserting snapshot:", err.message);
     }
@@ -119,11 +119,11 @@ export function collectSnapshot(data) {
 /**
  * Revisa mercados que ya terminaron y registra su outcome.
  */
-export function checkPendingOutcomes(currentChainlinkPrice) {
+export async function checkPendingOutcomes(currentChainlinkPrice) {
   if (currentChainlinkPrice === null || currentChainlinkPrice === undefined) return;
 
   try {
-    const pending = getPendingOutcomes();
+    const pending = await getPendingOutcomes();
     
     for (const market of pending) {
       const { market_slug, market_end_time, price_to_beat } = market;
@@ -140,7 +140,7 @@ export function checkPendingOutcomes(currentChainlinkPrice) {
       // Por ahora usamos el precio actual como aproximación si no tenemos mejor dato
       const outcome = currentChainlinkPrice > price_to_beat ? "UP" : "DOWN";
       
-      insertOutcome({
+      await insertOutcome({
         market_slug,
         market_end_time,
         price_to_beat,
@@ -170,7 +170,9 @@ export function startOutcomeChecker(getChainlinkPriceFn, intervalMs = 60_000) {
   outcomeCheckInterval = setInterval(() => {
     const price = getChainlinkPriceFn();
     if (price !== null) {
-      checkPendingOutcomes(price);
+      checkPendingOutcomes(price).catch(err => {
+          if (process.env.DEBUG_COLLECTOR) console.error(err);
+      });
     }
   }, intervalMs);
   
