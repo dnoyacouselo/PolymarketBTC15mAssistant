@@ -117,16 +117,6 @@ export function decide({
     return { action: "NO_TRADE", side: null, phase, reason: "chop_regime_not_late" };
   }
 
-  // --- FILTRO 5b: MID phase tuvo 38.9% precision - requiere evidencia extra ---
-  // Solo permitir MID si hay al menos 3 indicadores de acuerdo y edge alto
-  if (phase === "MID") {
-    const midMinAgreement = 3;
-    const midMinEdge = 0.18;
-    if (agreement < midMinAgreement || bestEdge < midMinEdge) {
-      return { action: "NO_TRADE", side: null, phase, reason: `mid_phase_weak_agr${agreement}_edge${bestEdge.toFixed(3)}` };
-    }
-  }
-
   // --- FILTRO 6: Senal contraria al regimen necesita mas evidencia ---
   // Ej: comprar UP en TREND_DOWN necesita divergencia bullish O acuerdo >= 4
   if (bestSide === "UP" && regimeKey === "TREND_DOWN") {

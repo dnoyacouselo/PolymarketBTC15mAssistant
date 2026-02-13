@@ -10,9 +10,9 @@ from collections import defaultdict
 
 SYMBOL = "BTCUSDT"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
-SIGNAL_FILE = "signals.csv"
+SIGNAL_FILE = "signals (4).csv"
 
-FILTER_FROM = "2026-02-10T00:00:00Z"
+FILTER_FROM = "2026-02-12T00:00:00Z"
 
 def load_signals():
     df = pd.read_csv(SIGNAL_FILE)
@@ -75,7 +75,7 @@ def determine_vote(signals):
 
 def main():
     print("=" * 80)
-    print("ANALISIS ULTIMAS 48H - Post cambios (scoring regimen + leading indicators)")
+    print("ANALISIS 12-FEB - Post ajuste MID + scoring regimen + leading indicators")
     print("=" * 80)
 
     df = load_signals()
