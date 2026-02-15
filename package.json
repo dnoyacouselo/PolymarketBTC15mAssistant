@@ -17,6 +17,7 @@
     "ethers": "^6.11.1",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",
+    "sqlite3": "^5.1.7",
     "undici": "^6.21.3",
     "ws": "^8.18.0"
   }

@@ -140,7 +140,7 @@ function cmdMarkets() {
   }
 }
 
-function cmdBacktest(args) {
+async function cmdBacktest(args) {
   printHeader("🔬 BACKTEST");
 
   try {
@@ -168,7 +168,7 @@ function cmdBacktest(args) {
     }
     console.log();
 
-    const results = runBacktest(config);
+    const results = await runBacktest(config);
 
     if (results.allTrades.length === 0) {
       printError("No se generaron trades. Verifica que tienes datos y outcomes.");
@@ -387,7 +387,7 @@ ${ANSI.cyan}Ejemplos:${ANSI.reset}
 
 // ==================== MAIN ====================
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const command = args[0]?.toLowerCase() ?? "help";
   const cmdArgs = args.slice(1);
@@ -402,7 +402,7 @@ function main() {
         break;
       case "backtest":
       case "bt":
-        cmdBacktest(cmdArgs);
+        await cmdBacktest(cmdArgs);
         break;
       case "optimize":
       case "opt":

@@ -332,6 +332,52 @@ export function getAllTrades(options = {}) {
   return allAsync(query, params);
 }
 
+export async function getStats() {
+  try {
+    const snapshotResult = await getAsync(`SELECT COUNT(*) as count FROM snapshots`);
+    const snapshotCount = snapshotResult?.count || 0;
+
+    const marketResult = await getAsync(`SELECT COUNT(DISTINCT market_slug) as count FROM snapshots WHERE market_slug IS NOT NULL`);
+    const marketCount = marketResult?.count || 0;
+
+    const outcomeResult = await getAsync(`SELECT COUNT(*) as count FROM market_outcomes`);
+    const outcomeCount = outcomeResult?.count || 0;
+
+    const tradeResult = await getAsync(`SELECT COUNT(*) as count FROM simulated_trades`);
+    const tradeCount = tradeResult?.count || 0;
+
+    const resolvedResult = await getAsync(`SELECT COUNT(*) as count FROM simulated_trades WHERE outcome IS NOT NULL`);
+    const resolvedTradeCount = resolvedResult?.count || 0;
+
+    const firstResult = await getAsync(`SELECT MIN(timestamp) as first_ts FROM snapshots`);
+    const firstSnapshot = firstResult?.first_ts || null;
+
+    const lastResult = await getAsync(`SELECT MAX(timestamp) as last_ts FROM snapshots`);
+    const lastSnapshot = lastResult?.last_ts || null;
+
+    return {
+      snapshotCount,
+      marketCount,
+      outcomeCount,
+      tradeCount,
+      resolvedTradeCount,
+      firstSnapshot,
+      lastSnapshot
+    };
+  } catch (err) {
+    console.error("Error getting stats:", err);
+    return {
+      snapshotCount: 0,
+      marketCount: 0,
+      outcomeCount: 0,
+      tradeCount: 0,
+      resolvedTradeCount: 0,
+      firstSnapshot: null,
+      lastSnapshot: null
+    };
+  }
+}
+
 export function closeDb() {
     if (db) {
         db.close();

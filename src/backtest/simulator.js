@@ -154,9 +154,9 @@ export function simulateMarket(marketSlug, config = {}) {
 /**
  * Ejecuta backtest completo sobre todos los mercados con outcome conocido.
  */
-export function runBacktest(config = {}) {
+export async function runBacktest(config = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
-  const markets = getDistinctMarkets();
+  const markets = await getDistinctMarkets();
   
   const results = {
     config: cfg,
@@ -168,7 +168,7 @@ export function runBacktest(config = {}) {
   };
 
   for (const market of markets) {
-    const outcome = getOutcome(market.market_slug);
+    const outcome = await getOutcome(market.market_slug);
     if (!outcome) continue;  // Saltar mercados sin outcome
 
     const marketResult = simulateMarket(market.market_slug, cfg);
