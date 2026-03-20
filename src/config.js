@@ -25,6 +25,14 @@ export const CONFIG = {
     downOutcomeLabel: process.env.POLYMARKET_DOWN_LABEL || "Down"
   },
 
+  execution: {
+    enabled: (process.env.EXECUTION_ENABLED || "false").toLowerCase() === "true",
+    gamma: parseFloat(process.env.MAKER_GAMMA || "0.1"),
+    maxInventory: parseInt(process.env.MAKER_MAX_INVENTORY || "50", 10),
+    positionSize: parseFloat(process.env.MAKER_POSITION_SIZE || "10"),
+    refreshIntervalMs: parseInt(process.env.MAKER_REFRESH_MS || "5000", 10)
+  },
+
   chainlink: {
     polygonRpcUrls: (process.env.POLYGON_RPC_URLS || "").split(",").map((s) => s.trim()).filter(Boolean),
     polygonRpcUrl: process.env.POLYGON_RPC_URL || "https://polygon-rpc.com",

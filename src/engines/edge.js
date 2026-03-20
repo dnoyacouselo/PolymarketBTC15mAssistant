@@ -47,11 +47,23 @@ export function decide({
   modelUp = null,
   modelDown = null,
   regime = null,
-  signals = {}
+  signals = {},
+  vpin = null,
+  uncertainty = null
 }) {
   const phase = remainingMinutes > 10 ? "EARLY" : remainingMinutes > 5 ? "MID" : "LATE";
   const agreement = signals.agreement ?? 0;
   const divergence = signals.divergence ?? "NONE";
+
+  // --- HARD BLOCK: Toxic flow (VPIN) ---
+  if (vpin !== null && vpin > 0.7) {
+    return { action: "NO_TRADE", side: null, phase, reason: `toxic_flow_vpin_${vpin.toFixed(2)}` };
+  }
+
+  // --- HARD BLOCK: High uncertainty (bootstrap / MC Dropout) ---
+  if (uncertainty !== null && !uncertainty.confident) {
+    return { action: "NO_TRADE", side: null, phase, reason: `high_uncertainty_std_${uncertainty.std.toFixed(3)}` };
+  }
 
   // --- Umbrales por regimen + fase ---
   // En CHOP: muy dificil que entre
@@ -147,6 +159,11 @@ export function decide({
   const isGood = bestEdge >= 0.12 && agreement >= 2;
 
   const strength = isStrong ? "STRONG" : isGood ? "GOOD" : "OPTIONAL";
+
+  // Filtro experimental: solo operar en STRONG (GOOD tuvo 41.7% en signals 6)
+  if (strength !== "STRONG") {
+    return { action: "NO_TRADE", side: null, phase, reason: `strength_filter_${strength}` };
+  }
 
   return { action: "ENTER", side: bestSide, phase, strength, edge: bestEdge, reason: "signal_confirmed" };
 }

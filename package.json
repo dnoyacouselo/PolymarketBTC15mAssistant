@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "start": "node src/index.js",
+    "realbacktest": "node src/backtest/cli.js realbacktest",
     "backtest": "node src/backtest/cli.js backtest",
     "backtest:stats": "node src/backtest/cli.js stats",
     "backtest:markets": "node src/backtest/cli.js markets",
@@ -13,11 +14,10 @@
     "backtest:help": "node src/backtest/cli.js help"
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0",
     "ethers": "^6.11.1",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",
-    "sqlite3": "^5.1.7",
+    "sql.js": "^1.14.0",
     "undici": "^6.21.3",
     "ws": "^8.18.0"
   }

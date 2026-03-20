@@ -10,9 +10,9 @@ from collections import defaultdict
 
 SYMBOL = "BTCUSDT"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
-SIGNAL_FILE = "signals (4).csv"
+SIGNAL_FILE = "signals 6.csv"
 
-FILTER_FROM = "2026-02-12T00:00:00Z"
+FILTER_FROM = "2026-02-13T00:00:00Z"
 
 def load_signals():
     df = pd.read_csv(SIGNAL_FILE)
@@ -75,7 +75,7 @@ def determine_vote(signals):
 
 def main():
     print("=" * 80)
-    print("ANALISIS 12-FEB - Post ajuste MID + scoring regimen + leading indicators")
+    print("ANALISIS 13-17 FEB - Prueba extendida con datos Polymarket reales")
     print("=" * 80)
 
     df = load_signals()
@@ -261,14 +261,14 @@ def main():
     da = results['DOWN_vote']['c'] + results['DOWN_vote']['w']
 
     print(f"""
-    METRICA              v1 (45h pre)   v2 (48h post)
-    ---------------------------------------------------
-    Precision Global     44.68%         {acc:.2f}%
-    STRONG               27.5%          {results['STRONG']['c']/max(1,ss)*100:.1f}%
-    GOOD                 56.6%          {results['GOOD']['c']/max(1,gs)*100:.1f}%
-    Votos UP             25.5%          {results['UP_vote']['c']/max(1,ua)*100:.1f}%
-    Votos DOWN           55.3%          {results['DOWN_vote']['c']/max(1,da)*100:.1f}%
-    Total operaciones    154 en 44h     {total} en {duration}
+    METRICA              v1 (45h pre)   v2 (48h post)  v3 (12-Feb+MID) v4 (sin MID)
+    ---------------------------------------------------------------------------------
+    Precision Global     44.68%         55.06%         44.12%          {acc:.2f}%
+    STRONG               27.5%          ~40%           39.9%           {results['STRONG']['c']/max(1,ss)*100:.1f}%
+    GOOD                 56.6%          ~57%           39.4%           {results['GOOD']['c']/max(1,gs)*100:.1f}%
+    Votos UP             25.5%          ~54%           43.3%           {results['UP_vote']['c']/max(1,ua)*100:.1f}%
+    Votos DOWN           55.3%          ~56%           44.7%           {results['DOWN_vote']['c']/max(1,da)*100:.1f}%
+    Total operaciones    154/44h        89/48h         68/17h          {total}/{duration}
     """)
 
     print("=" * 80)

@@ -17,12 +17,15 @@ import { computeRsi, sma, slopeLast, detectRsiDivergence } from "./indicators/rs
 import { computeMacd } from "./indicators/macd.js";
 import { computeHeikenAshi, countConsecutive } from "./indicators/heikenAshi.js";
 import { detectVolumeSpike, computeVolumePressure } from "./indicators/volume.js";
-import { analyzePolymarketBook } from "./indicators/orderbook.js";
+import { analyzePolymarketBook, updateVpinBuffer, computeVPIN } from "./indicators/orderbook.js";
 import { detectRegime } from "./engines/regime.js";
-import { scoreDirection, applyTimeAwareness } from "./engines/probability.js";
+import { scoreDirection, binaryOptionPrice, blendProbabilities } from "./engines/probability.js";
+import { computeRealizedVolatility } from "./indicators/volatility.js";
+import { estimateUncertainty } from "./engines/uncertainty.js";
 import { computeEdge, decide } from "./engines/edge.js";
 import { appendCsvRow, formatNumber, formatPct, getCandleWindowTiming, sleep } from "./utils.js";
 import { startBinanceTradeStream } from "./data/binanceWs.js";
+import { bus, onThrottled } from "./core/eventBus.js";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -398,399 +401,390 @@ async function fetchPolymarketSnapshot() {
   };
 }
 
-async function main() {
-  const binanceStream = startBinanceTradeStream({ symbol: CONFIG.symbol });
-  const polymarketLiveStream = startPolymarketChainlinkPriceStream({});
-  const chainlinkStream = startChainlinkPriceStream({});
+// ==================== EVENT-DRIVEN MAIN ====================
 
-  // Iniciar el checker de outcomes para resolver mercados pasados
-  let lastChainlinkPrice = null;
-  startOutcomeChecker(() => lastChainlinkPrice, 60_000);
+let prevSpotPrice = null;
+let prevCurrentPrice = null;
+let priceToBeatState = { slug: null, value: null, setAtMs: null };
+let lastChainlinkPrice = null;
+let evaluating = false;
 
-  let prevSpotPrice = null;
-  let prevCurrentPrice = null;
-  let priceToBeatState = { slug: null, value: null, setAtMs: null };
+const CSV_HEADER = [
+  "timestamp", "entry_minute", "time_left_min", "regime", "signal",
+  "model_up", "model_down", "mkt_up", "mkt_down",
+  "edge_up", "edge_down", "recommendation"
+];
 
-  const header = [
-    "timestamp",
-    "entry_minute",
-    "time_left_min",
-    "regime",
-    "signal",
-    "model_up",
-    "model_down",
-    "mkt_up",
-    "mkt_down",
-    "edge_up",
-    "edge_down",
-    "recommendation"
-  ];
+async function evaluateSignal() {
+  if (evaluating) return;
+  evaluating = true;
+  const evalStart = Date.now();
 
-  while (true) {
+  try {
     const timing = getCandleWindowTiming(CONFIG.candleWindowMinutes);
 
-    const wsTick = binanceStream.getLast();
-    const wsPrice = wsTick?.price ?? null;
+    const chainlinkPromise = lastChainlinkPrice !== null
+      ? Promise.resolve({ price: lastChainlinkPrice, updatedAt: null, source: "cache" })
+      : fetchChainlinkBtcUsd();
 
-    const polymarketWsTick = polymarketLiveStream.getLast();
-    const polymarketWsPrice = polymarketWsTick?.price ?? null;
+    const [klines1m, , lastPrice, chainlink, poly] = await Promise.all([
+      fetchKlines({ interval: "1m", limit: 240 }),
+      fetchKlines({ interval: "5m", limit: 200 }),
+      fetchLastPrice(),
+      chainlinkPromise,
+      fetchPolymarketSnapshot()
+    ]);
 
-    const chainlinkWsTick = chainlinkStream.getLast();
-    const chainlinkWsPrice = chainlinkWsTick?.price ?? null;
+    const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
+    const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
+    const timeLeftMin = settlementLeftMin ?? timing.remainingMinutes;
 
-    try {
-      const chainlinkPromise = polymarketWsPrice !== null
-        ? Promise.resolve({ price: polymarketWsPrice, updatedAt: polymarketWsTick?.updatedAt ?? null, source: "polymarket_ws" })
-        : chainlinkWsPrice !== null
-          ? Promise.resolve({ price: chainlinkWsPrice, updatedAt: chainlinkWsTick?.updatedAt ?? null, source: "chainlink_ws" })
-          : fetchChainlinkBtcUsd();
+    const candles = klines1m;
+    const closes = candles.map((c) => c.close);
 
-      const [klines1m, klines5m, lastPrice, chainlink, poly] = await Promise.all([
-        fetchKlines({ interval: "1m", limit: 240 }),
-        fetchKlines({ interval: "5m", limit: 200 }),
-        fetchLastPrice(),
-        chainlinkPromise,
-        fetchPolymarketSnapshot()
-      ]);
+    const vwap = computeSessionVwap(candles);
+    const vwapSeries = computeVwapSeries(candles);
+    const vwapNow = vwapSeries[vwapSeries.length - 1];
 
-      const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
-      const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
+    const lookback = CONFIG.vwapSlopeLookbackMinutes;
+    const vwapSlope = vwapSeries.length >= lookback ? (vwapNow - vwapSeries[vwapSeries.length - lookback]) / lookback : null;
+    const vwapDist = vwapNow ? (lastPrice - vwapNow) / vwapNow : null;
 
-      const timeLeftMin = settlementLeftMin ?? timing.remainingMinutes;
+    const rsiNow = computeRsi(closes, CONFIG.rsiPeriod);
+    const rsiSeries = [];
+    for (let i = 0; i < closes.length; i += 1) {
+      const sub = closes.slice(0, i + 1);
+      const r = computeRsi(sub, CONFIG.rsiPeriod);
+      if (r !== null) rsiSeries.push(r);
+    }
+    const rsiSlope = slopeLast(rsiSeries, 3);
 
-      const candles = klines1m;
-      const closes = candles.map((c) => c.close);
+    const macd = computeMacd(closes, CONFIG.macdFast, CONFIG.macdSlow, CONFIG.macdSignal);
+    const ha = computeHeikenAshi(candles);
+    const consec = countConsecutive(ha);
 
-      const vwap = computeSessionVwap(candles);
-      const vwapSeries = computeVwapSeries(candles);
-      const vwapNow = vwapSeries[vwapSeries.length - 1];
+    const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
+    const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
+    const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
 
-      const lookback = CONFIG.vwapSlopeLookbackMinutes;
-      const vwapSlope = vwapSeries.length >= lookback ? (vwapNow - vwapSeries[vwapSeries.length - lookback]) / lookback : null;
-      const vwapDist = vwapNow ? (lastPrice - vwapNow) / vwapNow : null;
+    const failedVwapReclaim = vwapNow !== null && vwapSeries.length >= 3
+      ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
+      : false;
 
-      const rsiNow = computeRsi(closes, CONFIG.rsiPeriod);
-      const rsiSeries = [];
-      for (let i = 0; i < closes.length; i += 1) {
-        const sub = closes.slice(0, i + 1);
-        const r = computeRsi(sub, CONFIG.rsiPeriod);
-        if (r !== null) rsiSeries.push(r);
+    const divergence = detectRsiDivergence(closes, rsiSeries, 20);
+    const volSpike = detectVolumeSpike(candles, 60, 2.0);
+    const volPressure = computeVolumePressure(candles, 20);
+
+    const regimeInfo = detectRegime({
+      price: lastPrice,
+      vwap: vwapNow,
+      vwapSlope,
+      vwapCrossCount,
+      volumeRecent,
+      volumeAvg
+    });
+
+    const marketUp = poly.ok ? poly.prices.up : null;
+    const marketDown = poly.ok ? poly.prices.down : null;
+
+    const polyBook = analyzePolymarketBook({
+      marketUp,
+      marketDown,
+      upBook: poly.ok ? poly.orderbook.up : null,
+      downBook: poly.ok ? poly.orderbook.down : null
+    });
+
+    if (poly.ok) {
+      updateVpinBuffer(poly.orderbook.up, poly.orderbook.down);
+    }
+    const vpin = computeVPIN();
+
+    const scored = scoreDirection({
+      regime: regimeInfo.regime,
+      price: lastPrice,
+      vwap: vwapNow,
+      vwapSlope,
+      rsi: rsiNow,
+      rsiSlope,
+      macd,
+      heikenColor: consec.color,
+      heikenCount: consec.count,
+      failedVwapReclaim,
+      divergence,
+      volumeSpike: volSpike,
+      volumePressure: volPressure,
+      polymarketBook: polyBook
+    });
+
+    const spotPrice = prevSpotPrice ?? lastPrice;
+    const currentPrice = chainlink?.price ?? null;
+    const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
+    const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
+
+    if (marketSlug && priceToBeatState.slug !== marketSlug) {
+      priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
+    }
+    if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
+      const nowMs = Date.now();
+      if (marketStartMs === null || nowMs >= marketStartMs) {
+        priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
       }
-      const rsiMa = sma(rsiSeries, CONFIG.rsiMaPeriod);
-      const rsiSlope = slopeLast(rsiSeries, 3);
+    }
+    const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
 
-      const macd = computeMacd(closes, CONFIG.macdFast, CONFIG.macdSlow, CONFIG.macdSignal);
+    const sigma = computeRealizedVolatility(closes, 20);
+    const optionProb = binaryOptionPrice({
+      spot: currentPrice ?? spotPrice,
+      priceToBeat,
+      sigma,
+      remainingMinutes: timeLeftMin,
+      barMinutes: 1
+    });
+    const blended = blendProbabilities(optionProb.probUp, scored.rawUp, 0.6);
 
-      const ha = computeHeikenAshi(candles);
-      const consec = countConsecutive(ha);
+    const edge = computeEdge({ modelUp: blended.adjustedUp, modelDown: blended.adjustedDown, marketYes: marketUp, marketNo: marketDown });
 
-      const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
-      const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
-      const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
+    // Uncertainty estimation via indicator bootstrap
+    const scoringInputs = {
+      regime: regimeInfo.regime,
+      price: lastPrice,
+      vwap: vwapNow,
+      vwapSlope,
+      rsi: rsiNow,
+      rsiSlope,
+      macd,
+      heikenColor: consec.color,
+      heikenCount: consec.count,
+      failedVwapReclaim,
+      divergence,
+      volumeSpike: volSpike,
+      volumePressure: volPressure,
+      polymarketBook: polyBook
+    };
+    const uncertainty = estimateUncertainty(scoringInputs, 20);
 
-      const failedVwapReclaim = vwapNow !== null && vwapSeries.length >= 3
-        ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
-        : false;
+    const rec = decide({
+      remainingMinutes: timeLeftMin,
+      edgeUp: edge.edgeUp,
+      edgeDown: edge.edgeDown,
+      modelUp: blended.adjustedUp,
+      modelDown: blended.adjustedDown,
+      regime: regimeInfo.regime,
+      signals: scored.signals,
+      vpin,
+      uncertainty
+    });
 
-      // --- Nuevos indicadores leading ---
-      const divergence = detectRsiDivergence(closes, rsiSeries, 20);
-      const volSpike = detectVolumeSpike(candles, 60, 2.0);
-      const volPressure = computeVolumePressure(candles, 20);
+    // Emit result for downstream consumers (maker, logger, etc.)
+    const latencyMs = Date.now() - evalStart;
+    bus.emit("signal:result", { rec, edge, blended, regimeInfo, vpin, latencyMs });
 
-      const regimeInfo = detectRegime({
-        price: lastPrice,
-        vwap: vwapNow,
-        vwapSlope,
-        vwapCrossCount,
-        volumeRecent,
-        volumeAvg
-      });
+    // ==================== RENDER ====================
 
-      const marketUp = poly.ok ? poly.prices.up : null;
-      const marketDown = poly.ok ? poly.prices.down : null;
+    const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
+    const macdLabel = macd === null
+      ? "-"
+      : macd.hist < 0
+        ? (macd.histDelta !== null && macd.histDelta < 0 ? "bearish (expanding)" : "bearish")
+        : (macd.histDelta !== null && macd.histDelta > 0 ? "bullish (expanding)" : "bullish");
 
-      const polyBook = analyzePolymarketBook({
-        marketUp,
-        marketDown,
-        upBook: poly.ok ? poly.orderbook.up : null,
-        downBook: poly.ok ? poly.orderbook.down : null
-      });
+    const lastCandle = klines1m.length ? klines1m[klines1m.length - 1] : null;
+    const lastClose = lastCandle?.close ?? null;
+    const close1mAgo = klines1m.length >= 2 ? klines1m[klines1m.length - 2]?.close ?? null : null;
+    const close3mAgo = klines1m.length >= 4 ? klines1m[klines1m.length - 4]?.close ?? null : null;
+    const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
+    const delta3m = lastClose !== null && close3mAgo !== null ? lastClose - close3mAgo : null;
 
-      // --- Scoring adaptativo por regimen ---
-      const scored = scoreDirection({
-        regime: regimeInfo.regime,
-        price: lastPrice,
-        vwap: vwapNow,
-        vwapSlope,
-        rsi: rsiNow,
-        rsiSlope,
-        macd,
-        heikenColor: consec.color,
-        heikenCount: consec.count,
-        failedVwapReclaim,
-        divergence,
-        volumeSpike: volSpike,
-        volumePressure: volPressure,
-        polymarketBook: polyBook
-      });
+    const haNarrative = (consec.color ?? "").toLowerCase() === "green" ? "LONG" : (consec.color ?? "").toLowerCase() === "red" ? "SHORT" : "NEUTRAL";
+    const rsiNarrative = narrativeFromSlope(rsiSlope);
+    const macdNarrative = narrativeFromSign(macd?.hist ?? null);
+    const vwapNarrative = narrativeFromSign(vwapDist);
 
-      const timeAware = applyTimeAwareness(scored.rawUp, timeLeftMin, CONFIG.candleWindowMinutes);
+    const pLong = blended?.adjustedUp ?? null;
+    const pShort = blended?.adjustedDown ?? null;
+    const predictValue = `${ANSI.green}LONG${ANSI.reset} ${ANSI.green}${formatProbPct(pLong, 0)}${ANSI.reset} / ${ANSI.red}SHORT${ANSI.reset} ${ANSI.red}${formatProbPct(pShort, 0)}${ANSI.reset}`;
 
-      const edge = computeEdge({ modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, marketYes: marketUp, marketNo: marketDown });
+    const marketUpStr = `${marketUp ?? "-"}${marketUp === null || marketUp === undefined ? "" : "¢"}`;
+    const marketDownStr = `${marketDown ?? "-"}${marketDown === null || marketDown === undefined ? "" : "¢"}`;
+    const polyHeaderValue = `${ANSI.green}↑ UP${ANSI.reset} ${marketUpStr}  |  ${ANSI.red}↓ DOWN${ANSI.reset} ${marketDownStr}`;
 
-      // --- Decision mejorada con filtros de agreement y divergencia ---
-      const rec = decide({
-        remainingMinutes: timeLeftMin,
-        edgeUp: edge.edgeUp,
-        edgeDown: edge.edgeDown,
-        modelUp: timeAware.adjustedUp,
-        modelDown: timeAware.adjustedDown,
-        regime: regimeInfo.regime,
-        signals: scored.signals
-      });
+    const heikenValue = `${consec.color ?? "-"} x${consec.count}`;
+    const heikenLine = formatNarrativeValue("Heiken Ashi", heikenValue, haNarrative);
+    const rsiArrow = rsiSlope !== null && rsiSlope < 0 ? "↓" : rsiSlope !== null && rsiSlope > 0 ? "↑" : "-";
+    const rsiValue = `${formatNumber(rsiNow, 1)} ${rsiArrow}`;
+    const rsiLine = formatNarrativeValue("RSI", rsiValue, rsiNarrative);
+    const macdLine = formatNarrativeValue("MACD", macdLabel, macdNarrative);
+    const delta1Narrative = narrativeFromSign(delta1m);
+    const delta3Narrative = narrativeFromSign(delta3m);
+    const deltaValue = `${colorByNarrative(formatSignedDelta(delta1m, lastClose), delta1Narrative)} | ${colorByNarrative(formatSignedDelta(delta3m, lastClose), delta3Narrative)}`;
+    const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
+    const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
+    const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
 
-      const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
+    const liquidity = poly.ok ? (Number(poly.market?.liquidityNum) || Number(poly.market?.liquidity) || null) : null;
 
-      const macdLabel = macd === null
-        ? "-"
-        : macd.hist < 0
-          ? (macd.histDelta !== null && macd.histDelta < 0 ? "bearish (expanding)" : "bearish")
-          : (macd.histDelta !== null && macd.histDelta > 0 ? "bullish (expanding)" : "bullish");
+    const currentPriceBaseLine = colorPriceLine({ label: "CURRENT PRICE", price: currentPrice, prevPrice: prevCurrentPrice, decimals: 2, prefix: "$" });
+    const ptbDelta = (currentPrice !== null && priceToBeat !== null && Number.isFinite(currentPrice) && Number.isFinite(priceToBeat))
+      ? currentPrice - priceToBeat : null;
+    const ptbDeltaColor = ptbDelta === null ? ANSI.gray : ptbDelta > 0 ? ANSI.green : ptbDelta < 0 ? ANSI.red : ANSI.gray;
+    const ptbDeltaText = ptbDelta === null
+      ? `${ANSI.gray}-${ANSI.reset}`
+      : `${ptbDeltaColor}${ptbDelta > 0 ? "+" : ptbDelta < 0 ? "-" : ""}$${Math.abs(ptbDelta).toFixed(2)}${ANSI.reset}`;
+    const currentPriceValue = currentPriceBaseLine.split(": ")[1] ?? currentPriceBaseLine;
+    const currentPriceLine = kv("CURRENT PRICE:", `${currentPriceValue} (${ptbDeltaText})`);
 
-      const lastCandle = klines1m.length ? klines1m[klines1m.length - 1] : null;
-      const lastClose = lastCandle?.close ?? null;
-      const close1mAgo = klines1m.length >= 2 ? klines1m[klines1m.length - 2]?.close ?? null : null;
-      const close3mAgo = klines1m.length >= 4 ? klines1m[klines1m.length - 4]?.close ?? null : null;
-      const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
-      const delta3m = lastClose !== null && close3mAgo !== null ? lastClose - close3mAgo : null;
-
-      const haNarrative = (consec.color ?? "").toLowerCase() === "green" ? "LONG" : (consec.color ?? "").toLowerCase() === "red" ? "SHORT" : "NEUTRAL";
-      const rsiNarrative = narrativeFromSlope(rsiSlope);
-      const macdNarrative = narrativeFromSign(macd?.hist ?? null);
-      const vwapNarrative = narrativeFromSign(vwapDist);
-
-      const pLong = timeAware?.adjustedUp ?? null;
-      const pShort = timeAware?.adjustedDown ?? null;
-      const predictNarrative = (pLong !== null && pShort !== null && Number.isFinite(pLong) && Number.isFinite(pShort))
-        ? (pLong > pShort ? "LONG" : pShort > pLong ? "SHORT" : "NEUTRAL")
-        : "NEUTRAL";
-      const predictValue = `${ANSI.green}LONG${ANSI.reset} ${ANSI.green}${formatProbPct(pLong, 0)}${ANSI.reset} / ${ANSI.red}SHORT${ANSI.reset} ${ANSI.red}${formatProbPct(pShort, 0)}${ANSI.reset}`;
-      const predictLine = `Predict: ${predictValue}`;
-
-      const marketUpStr = `${marketUp ?? "-"}${marketUp === null || marketUp === undefined ? "" : "¢"}`;
-      const marketDownStr = `${marketDown ?? "-"}${marketDown === null || marketDown === undefined ? "" : "¢"}`;
-      const polyHeaderValue = `${ANSI.green}↑ UP${ANSI.reset} ${marketUpStr}  |  ${ANSI.red}↓ DOWN${ANSI.reset} ${marketDownStr}`;
-
-      const heikenValue = `${consec.color ?? "-"} x${consec.count}`;
-      const heikenLine = formatNarrativeValue("Heiken Ashi", heikenValue, haNarrative);
-
-      const rsiArrow = rsiSlope !== null && rsiSlope < 0 ? "↓" : rsiSlope !== null && rsiSlope > 0 ? "↑" : "-";
-      const rsiValue = `${formatNumber(rsiNow, 1)} ${rsiArrow}`;
-      const rsiLine = formatNarrativeValue("RSI", rsiValue, rsiNarrative);
-
-      const macdLine = formatNarrativeValue("MACD", macdLabel, macdNarrative);
-
-      const delta1Narrative = narrativeFromSign(delta1m);
-      const delta3Narrative = narrativeFromSign(delta3m);
-      const deltaValue = `${colorByNarrative(formatSignedDelta(delta1m, lastClose), delta1Narrative)} | ${colorByNarrative(formatSignedDelta(delta3m, lastClose), delta3Narrative)}`;
-      const deltaLine = `Delta 1/3Min: ${deltaValue}`;
-
-      const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
-      const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
-
-      const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
-
-      const actionLine = rec.action === "ENTER"
-        ? `${rec.action} NOW (${rec.phase} ENTRY)`
-        : `NO TRADE (${rec.phase})`;
-
-      const spreadUp = poly.ok ? poly.orderbook.up.spread : null;
-      const spreadDown = poly.ok ? poly.orderbook.down.spread : null;
-
-      const spread = spreadUp !== null && spreadDown !== null ? Math.max(spreadUp, spreadDown) : (spreadUp ?? spreadDown);
-      const liquidity = poly.ok
-        ? (Number(poly.market?.liquidityNum) || Number(poly.market?.liquidity) || null)
-        : null;
-
-      const spotPrice = wsPrice ?? lastPrice;
-      const currentPrice = chainlink?.price ?? null;
-      const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
-      const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
-
-      if (marketSlug && priceToBeatState.slug !== marketSlug) {
-        priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
+    if (poly.ok && poly.market && priceToBeatState.value === null) {
+      const slug = safeFileSlug(poly.market.slug || poly.market.id || "market");
+      if (slug && !dumpedMarkets.has(slug)) {
+        dumpedMarkets.add(slug);
+        try {
+          fs.mkdirSync("./logs", { recursive: true });
+          fs.writeFileSync(path.join("./logs", `polymarket_market_${slug}.json`), JSON.stringify(poly.market, null, 2), "utf8");
+        } catch { /* ignore */ }
       }
-
-      if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
-        const nowMs = Date.now();
-        const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
-        if (okToLatch) {
-          priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
-        }
-      }
-
-      const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
-      const currentPriceBaseLine = colorPriceLine({
-        label: "CURRENT PRICE",
-        price: currentPrice,
-        prevPrice: prevCurrentPrice,
-        decimals: 2,
-        prefix: "$"
-      });
-
-      const ptbDelta = (currentPrice !== null && priceToBeat !== null && Number.isFinite(currentPrice) && Number.isFinite(priceToBeat))
-        ? currentPrice - priceToBeat
-        : null;
-      const ptbDeltaColor = ptbDelta === null
-        ? ANSI.gray
-        : ptbDelta > 0
-          ? ANSI.green
-          : ptbDelta < 0
-            ? ANSI.red
-            : ANSI.gray;
-      const ptbDeltaText = ptbDelta === null
-        ? `${ANSI.gray}-${ANSI.reset}`
-        : `${ptbDeltaColor}${ptbDelta > 0 ? "+" : ptbDelta < 0 ? "-" : ""}$${Math.abs(ptbDelta).toFixed(2)}${ANSI.reset}`;
-      const currentPriceValue = currentPriceBaseLine.split(": ")[1] ?? currentPriceBaseLine;
-      const currentPriceLine = kv("CURRENT PRICE:", `${currentPriceValue} (${ptbDeltaText})`);
-
-      if (poly.ok && poly.market && priceToBeatState.value === null) {
-        const slug = safeFileSlug(poly.market.slug || poly.market.id || "market");
-        if (slug && !dumpedMarkets.has(slug)) {
-          dumpedMarkets.add(slug);
-          try {
-            fs.mkdirSync("./logs", { recursive: true });
-            fs.writeFileSync(path.join("./logs", `polymarket_market_${slug}.json`), JSON.stringify(poly.market, null, 2), "utf8");
-          } catch {
-            // ignore
-          }
-        }
-      }
-
-      const binanceSpotBaseLine = colorPriceLine({ label: "BTC (Binance)", price: spotPrice, prevPrice: prevSpotPrice, decimals: 0, prefix: "$" });
-      const diffLine = (spotPrice !== null && currentPrice !== null && Number.isFinite(spotPrice) && Number.isFinite(currentPrice) && currentPrice !== 0)
-        ? (() => {
-          const diffUsd = spotPrice - currentPrice;
-          const diffPct = (diffUsd / currentPrice) * 100;
-          const sign = diffUsd > 0 ? "+" : diffUsd < 0 ? "-" : "";
-          return ` (${sign}$${Math.abs(diffUsd).toFixed(2)}, ${sign}${Math.abs(diffPct).toFixed(2)}%)`;
-        })()
-        : "";
-      const binanceSpotLine = `${binanceSpotBaseLine}${diffLine}`;
-      const binanceSpotValue = binanceSpotLine.split(": ")[1] ?? binanceSpotLine;
-      const binanceSpotKvLine = kv("BTC (Binance):", binanceSpotValue);
-
-      const titleLine = poly.ok ? `${poly.market?.question ?? "-"}` : "-";
-      const marketLine = kv("Market:", poly.ok ? (poly.market?.slug ?? "-") : "-");
-
-      const timeColor = timeLeftMin >= 10 && timeLeftMin <= 15
-        ? ANSI.green
-        : timeLeftMin >= 5 && timeLeftMin < 10
-          ? ANSI.yellow
-          : timeLeftMin >= 0 && timeLeftMin < 5
-            ? ANSI.red
-            : ANSI.reset;
-      const timeLeftLine = `⏱ Time left: ${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`;
-
-      const polyTimeLeftColor = settlementLeftMin !== null
-        ? (settlementLeftMin >= 10 && settlementLeftMin <= 15
-          ? ANSI.green
-          : settlementLeftMin >= 5 && settlementLeftMin < 10
-            ? ANSI.yellow
-            : settlementLeftMin >= 0 && settlementLeftMin < 5
-              ? ANSI.red
-              : ANSI.reset)
-        : ANSI.reset;
-
-      const lines = [
-        titleLine,
-        marketLine,
-        kv("Time left:", `${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`),
-        "",
-        sepLine(),
-        "",
-        kv("TA Predict:", predictValue),
-        kv("Heiken Ashi:", heikenLine.split(": ")[1] ?? heikenLine),
-        kv("RSI:", rsiLine.split(": ")[1] ?? rsiLine),
-        kv("MACD:", macdLine.split(": ")[1] ?? macdLine),
-        kv("Delta 1/3:", deltaLine.split(": ")[1] ?? deltaLine),
-        kv("VWAP:", vwapLine.split(": ")[1] ?? vwapLine),
-        "",
-        sepLine(),
-        "",
-        kv("POLYMARKET:", polyHeaderValue),
-        liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
-        settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("PRICE TO BEAT: ", `$${formatNumber(priceToBeat, 0)}`) : kv("PRICE TO BEAT: ", `${ANSI.gray}-${ANSI.reset}`),
-        currentPriceLine,
-        "",
-        sepLine(),
-        "",
-        binanceSpotKvLine,
-        "",
-        sepLine(),
-        "",
-        kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
-        "",
-        sepLine(),
-        centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
-      ].filter((x) => x !== null);
-
-      renderScreen(lines.join("\n") + "\n");
-
-      prevSpotPrice = spotPrice ?? prevSpotPrice;
-      prevCurrentPrice = currentPrice ?? prevCurrentPrice;
-      lastChainlinkPrice = currentPrice ?? lastChainlinkPrice;
-
-      // Recolectar snapshot para backtesting
-      try {
-        const collectorData = buildCollectorData({
-          poly,
-          chainlinkPrice: currentPrice,
-          binancePrice: spotPrice,
-          priceToBeat,
-          rsiNow,
-          rsiSlope,
-          macd,
-          vwapNow,
-          vwapSlope,
-          vwapDist,
-          consec,
-          delta1m,
-          delta3m,
-          regimeInfo,
-          timeAware,
-          edge,
-          rec,
-          timeLeftMin
-        });
-        collectSnapshot(collectorData);
-      } catch {
-        // Silenciar errores del collector para no interrumpir el loop
-      }
-
-      appendCsvRow("./logs/signals.csv", header, [
-        new Date().toISOString(),
-        timing.elapsedMinutes.toFixed(3),
-        timeLeftMin.toFixed(3),
-        regimeInfo.regime,
-        signal,
-        timeAware.adjustedUp,
-        timeAware.adjustedDown,
-        marketUp,
-        marketDown,
-        edge.edgeUp,
-        edge.edgeDown,
-        rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE"
-      ]);
-    } catch (err) {
-      console.log("────────────────────────────");
-      console.log(`Error: ${err?.message ?? String(err)}`);
-      console.log("────────────────────────────");
     }
 
-    await sleep(CONFIG.pollIntervalMs);
+    const binanceSpotBaseLine = colorPriceLine({ label: "BTC (Binance)", price: spotPrice, prevPrice: prevSpotPrice, decimals: 0, prefix: "$" });
+    const diffLine = (spotPrice !== null && currentPrice !== null && Number.isFinite(spotPrice) && Number.isFinite(currentPrice) && currentPrice !== 0)
+      ? (() => { const d = spotPrice - currentPrice; const p = (d / currentPrice) * 100; const s = d > 0 ? "+" : d < 0 ? "-" : ""; return ` (${s}$${Math.abs(d).toFixed(2)}, ${s}${Math.abs(p).toFixed(2)}%)`; })()
+      : "";
+    const binanceSpotValue = (binanceSpotBaseLine + diffLine).split(": ")[1] ?? "";
+    const binanceSpotKvLine = kv("BTC (Binance):", binanceSpotValue);
+
+    const titleLine = poly.ok ? `${poly.market?.question ?? "-"}` : "-";
+    const timeColor = timeLeftMin >= 10 && timeLeftMin <= 15 ? ANSI.green : timeLeftMin >= 5 && timeLeftMin < 10 ? ANSI.yellow : timeLeftMin >= 0 && timeLeftMin < 5 ? ANSI.red : ANSI.reset;
+    const polyTimeLeftColor = settlementLeftMin !== null
+      ? (settlementLeftMin >= 10 && settlementLeftMin <= 15 ? ANSI.green : settlementLeftMin >= 5 && settlementLeftMin < 10 ? ANSI.yellow : settlementLeftMin >= 0 && settlementLeftMin < 5 ? ANSI.red : ANSI.reset)
+      : ANSI.reset;
+
+    const lines = [
+      titleLine,
+      kv("Market:", poly.ok ? (poly.market?.slug ?? "-") : "-"),
+      kv("Time left:", `${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`),
+      kv("Latency:", `${ANSI.dim}${latencyMs}ms${ANSI.reset}`),
+      "",
+      sepLine(),
+      "",
+      kv("TA Predict:", predictValue),
+      kv("Heiken Ashi:", heikenLine.split(": ")[1] ?? heikenLine),
+      kv("RSI:", rsiLine.split(": ")[1] ?? rsiLine),
+      kv("MACD:", macdLine.split(": ")[1] ?? macdLine),
+      kv("Delta 1/3:", `Delta 1/3Min: ${deltaValue}`.split(": ").slice(1).join(": ")),
+      kv("VWAP:", vwapLine.split(": ")[1] ?? vwapLine),
+      vpin !== null ? kv("VPIN:", `${vpin.toFixed(3)}${vpin > 0.7 ? ` ${ANSI.red}TOXIC${ANSI.reset}` : ""}`) : null,
+      "",
+      sepLine(),
+      "",
+      kv("POLYMARKET:", polyHeaderValue),
+      liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
+      settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
+      priceToBeat !== null ? kv("PRICE TO BEAT: ", `$${formatNumber(priceToBeat, 0)}`) : kv("PRICE TO BEAT: ", `${ANSI.gray}-${ANSI.reset}`),
+      currentPriceLine,
+      "",
+      sepLine(),
+      "",
+      binanceSpotKvLine,
+      "",
+      sepLine(),
+      "",
+      kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
+      "",
+      sepLine(),
+      centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
+    ].filter((x) => x !== null);
+
+    renderScreen(lines.join("\n") + "\n");
+
+    prevSpotPrice = spotPrice ?? prevSpotPrice;
+    prevCurrentPrice = currentPrice ?? prevCurrentPrice;
+    lastChainlinkPrice = currentPrice ?? lastChainlinkPrice;
+
+    try {
+      const collectorData = buildCollectorData({
+        poly,
+        chainlinkPrice: currentPrice,
+        binancePrice: spotPrice,
+        priceToBeat,
+        rsiNow,
+        rsiSlope,
+        macd,
+        vwapNow,
+        vwapSlope,
+        vwapDist,
+        consec,
+        delta1m,
+        delta3m,
+        regimeInfo,
+        timeAware: blended,
+        edge,
+        rec,
+        timeLeftMin
+      });
+      collectSnapshot(collectorData);
+    } catch { /* ignore */ }
+
+    appendCsvRow("./logs/signals.csv", CSV_HEADER, [
+      new Date().toISOString(),
+      timing.elapsedMinutes.toFixed(3),
+      timeLeftMin.toFixed(3),
+      regimeInfo.regime,
+      signal,
+      blended.adjustedUp,
+      blended.adjustedDown,
+      marketUp,
+      marketDown,
+      edge.edgeUp,
+      edge.edgeDown,
+      rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE"
+    ]);
+  } catch (err) {
+    console.log("────────────────────────────");
+    console.log(`Error: ${err?.message ?? String(err)}`);
+    console.log("────────────────────────────");
+  } finally {
+    evaluating = false;
   }
+}
+
+async function main() {
+  // WebSocket streams emit price updates to the event bus
+  startBinanceTradeStream({
+    symbol: CONFIG.symbol,
+    onUpdate: (data) => {
+      prevSpotPrice = data.price;
+      bus.emit("price:binance", data);
+    }
+  });
+
+  startPolymarketChainlinkPriceStream({
+    onUpdate: (data) => {
+      lastChainlinkPrice = data.price;
+      bus.emit("price:polymarket", data);
+    }
+  });
+
+  startChainlinkPriceStream({
+    onUpdate: (data) => {
+      lastChainlinkPrice = data.price;
+      bus.emit("price:chainlink", data);
+    }
+  });
+
+  startOutcomeChecker(() => lastChainlinkPrice, 60_000);
+
+  // Throttled evaluation: at most once every 500ms, triggered by any price update
+  const THROTTLE_MS = 500;
+  onThrottled("price:chainlink", evaluateSignal, THROTTLE_MS);
+  onThrottled("price:polymarket", evaluateSignal, THROTTLE_MS);
+  onThrottled("price:binance", evaluateSignal, THROTTLE_MS);
+
+  // Fallback: if no WS events arrive, poll periodically
+  setInterval(() => {
+    bus.emit("price:binance", { price: prevSpotPrice, ts: Date.now() });
+  }, CONFIG.pollIntervalMs);
+
+  // Initial evaluation on startup
+  await evaluateSignal();
 }
 
 main();

@@ -1,9 +1,11 @@
 /**
- * Analisis de order book de Polymarket como indicador contrarian.
+ * Polymarket order book analysis:
+ *  1. Contrarian indicator (existing)
+ *  2. VPIN — Volume-synchronized Probability of Informed Trading
  *
- * Idea: cuando el mercado de Polymarket esta MUY sesgado en una direccion
- * (p.ej. 85% UP), el valor real puede estar en la direccion contraria.
- * Los mercados de prediccion tienden a sobre-reaccionar.
+ * VPIN measures the imbalance between buy-initiated and sell-initiated
+ * volume.  High VPIN (> 0.7) signals toxic flow — informed traders are
+ * active and it is dangerous to take the other side.
  */
 
 /**
@@ -68,4 +70,75 @@ export function analyzePolymarketBook({ marketUp, marketDown, upBook, downBook }
   }
 
   return result;
+}
+
+// ==================== VPIN ====================
+
+const vpinBuffer = [];
+const VPIN_WINDOW = 300; // snapshots (~5 min at 1 snapshot/sec)
+
+/**
+ * Feed a new orderbook snapshot into the rolling VPIN buffer.
+ *
+ * "Buy volume" is approximated as increase in bid-side liquidity on UP
+ * (or ask-side on DOWN) between consecutive snapshots.
+ * "Sell volume" is the opposite direction.
+ *
+ * @param {{ bidLiquidity: number|null, askLiquidity: number|null }} upBook
+ * @param {{ bidLiquidity: number|null, askLiquidity: number|null }} downBook
+ */
+export function updateVpinBuffer(upBook, downBook) {
+  const ts = Date.now();
+  const upBid = upBook?.bidLiquidity ?? 0;
+  const upAsk = upBook?.askLiquidity ?? 0;
+  const downBid = downBook?.bidLiquidity ?? 0;
+  const downAsk = downBook?.askLiquidity ?? 0;
+
+  vpinBuffer.push({ ts, upBid, upAsk, downBid, downAsk });
+
+  while (vpinBuffer.length > VPIN_WINDOW) {
+    vpinBuffer.shift();
+  }
+}
+
+/**
+ * Compute VPIN from the rolling buffer of orderbook snapshots.
+ *
+ * Buy-initiated volume ≈ increase in UP bid liquidity + increase in DOWN ask liquidity
+ * Sell-initiated volume ≈ increase in UP ask liquidity + increase in DOWN bid liquidity
+ *
+ * VPIN = |V_buy - V_sell| / (V_buy + V_sell)
+ *
+ * @returns {number|null} VPIN in [0, 1], or null if not enough data
+ */
+export function computeVPIN() {
+  if (vpinBuffer.length < 10) return null;
+
+  let buyVol = 0;
+  let sellVol = 0;
+
+  for (let i = 1; i < vpinBuffer.length; i++) {
+    const prev = vpinBuffer[i - 1];
+    const cur = vpinBuffer[i];
+
+    const dUpBid = cur.upBid - prev.upBid;
+    const dUpAsk = cur.upAsk - prev.upAsk;
+    const dDownBid = cur.downBid - prev.downBid;
+    const dDownAsk = cur.downAsk - prev.downAsk;
+
+    buyVol += Math.max(0, dUpBid) + Math.max(0, dDownAsk);
+    sellVol += Math.max(0, dUpAsk) + Math.max(0, dDownBid);
+  }
+
+  const total = buyVol + sellVol;
+  if (total <= 0) return null;
+
+  return Math.abs(buyVol - sellVol) / total;
+}
+
+/**
+ * Reset VPIN buffer (useful for tests).
+ */
+export function resetVpinBuffer() {
+  vpinBuffer.length = 0;
 }

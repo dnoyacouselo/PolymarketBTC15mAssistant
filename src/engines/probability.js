@@ -279,11 +279,87 @@ export function scoreDirection(inputs) {
 }
 
 /**
- * Ajuste temporal: a medida que queda menos tiempo, la probabilidad
- * converge hacia 50% (menos certeza).
+ * @deprecated Use binaryOptionPrice for accurate binary-option pricing.
+ * Kept for backwards compatibility in tests and old callers.
  */
 export function applyTimeAwareness(rawUp, remainingMinutes, windowMinutes) {
   const timeDecay = clamp(remainingMinutes / windowMinutes, 0, 1);
   const adjustedUp = clamp(0.5 + (rawUp - 0.5) * timeDecay, 0, 1);
   return { timeDecay, adjustedUp, adjustedDown: 1 - adjustedUp };
+}
+
+// ==================== BINARY OPTION PRICING ====================
+
+/**
+ * Standard normal CDF (Abramowitz & Stegun approximation, ~1e-7 precision).
+ */
+function normalCDF(x) {
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x) / Math.SQRT2;
+  const t = 1.0 / (1.0 + p * ax);
+  const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
+  return 0.5 * (1.0 + sign * y);
+}
+
+/**
+ * Binary-option pricing model.
+ *
+ * P(up) = CDF( ln(spot / priceToBeat) / (sigma * sqrt(T)) )
+ *
+ * where sigma is PER-BAR realised volatility (from computeRealizedVolatility)
+ * and T is remaining time expressed in bars (remainingMinutes / barMinutes).
+ *
+ * When spot > priceToBeat the probability of finishing above increases,
+ * and it concentrates toward 0 or 1 as time runs out — the correct
+ * behaviour for a cash-or-nothing binary option.
+ *
+ * @param {object}      opts
+ * @param {number|null} opts.spot            - current BTC price
+ * @param {number|null} opts.priceToBeat     - strike / reference price
+ * @param {number|null} opts.sigma           - per-bar realised vol
+ * @param {number}      opts.remainingMinutes
+ * @param {number}      opts.barMinutes      - bar size (default 15)
+ * @returns {{ probUp: number, probDown: number }}
+ */
+export function binaryOptionPrice({
+  spot,
+  priceToBeat,
+  sigma,
+  remainingMinutes,
+  barMinutes = 15
+}) {
+  if (
+    spot == null || priceToBeat == null || priceToBeat <= 0 || spot <= 0 ||
+    sigma == null || sigma <= 0 || remainingMinutes == null || remainingMinutes <= 0
+  ) {
+    return { probUp: 0.5, probDown: 0.5 };
+  }
+
+  const T = remainingMinutes / barMinutes; // time left in bars
+  const d = Math.log(spot / priceToBeat) / (sigma * Math.sqrt(T));
+  const probUp = clamp(normalCDF(d), 0.01, 0.99);
+  return { probUp, probDown: 1 - probUp };
+}
+
+/**
+ * Blend binary-option probability with TA-based rawUp score.
+ *
+ * Weight is dynamic: when the option model outputs ~0.5 (no directional info,
+ * e.g. spot ≈ priceToBeat), it effectively gets zero weight and TA dominates.
+ * As the option model becomes more extreme (spot far from strike, little time
+ * left), its weight rises up to wOptionMax.
+ *
+ * @param {number} optionProbUp - from binaryOptionPrice
+ * @param {number} taRawUp      - from scoreDirection
+ * @param {number} wOptionMax   - max weight for option model (0-1, default 0.6)
+ * @returns {{ adjustedUp: number, adjustedDown: number }}
+ */
+export function blendProbabilities(optionProbUp, taRawUp, wOptionMax = 0.6) {
+  const optionConfidence = Math.min(Math.abs(optionProbUp - 0.5) * 2, 1);
+  const wOption = wOptionMax * optionConfidence;
+  const wTa = 1 - wOption;
+  const adjustedUp = clamp(wOption * optionProbUp + wTa * taRawUp, 0.01, 0.99);
+  return { adjustedUp, adjustedDown: 1 - adjustedUp };
 }

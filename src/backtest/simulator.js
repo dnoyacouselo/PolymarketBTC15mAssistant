@@ -18,36 +18,22 @@ import { computeAllMetrics } from "./metrics.js";
  * Configuración por defecto para el simulador.
  */
 const DEFAULT_CONFIG = {
-  // Tamaño de posición
-  positionSize: 10,  // $10 por trade
-  
-  // Filtros de entrada
-  minEdge: 0.05,           // Edge mínimo para entrar
-  minModelProb: 0.55,      // Probabilidad mínima del modelo
-  
-  // Filtros por fase
+  positionSize: 10,
+  minEdge: 0.05,
+  minModelProb: 0.55,
   allowedPhases: ["EARLY", "MID", "LATE"],
-  
-  // Filtros por strength
   allowedStrengths: ["STRONG", "GOOD", "OPTIONAL"],
-  
-  // Solo una entrada por mercado
   oneEntryPerMarket: true,
-  
-  // Preferir señales más fuertes
   preferStrongerSignals: true,
-  
-  // Tiempo mínimo restante para entrar (minutos)
   minTimeLeft: 2,
-  
-  // Tiempo máximo restante para entrar (evitar entrar muy temprano)
   maxTimeLeft: 14,
-  
-  // Slippage simulado (en centavos, afecta al precio de entrada)
-  slippage: 0.5,  // 0.5 centavos
-  
-  // Comisión (porcentaje del tamaño)
-  commissionPct: 0.001  // 0.1%
+  slippage: 0.5,
+  commissionPct: 0.001,
+
+  // Maker (limit order) mode — more realistic fill simulation
+  useLimitOrders: false,
+  limitOrderDiscount: 1.0, // cents below model fair price
+  fillRequiresCross: true  // order only fills if market price crosses our limit
 };
 
 /**
@@ -101,17 +87,35 @@ export function simulateMarket(marketSlug, config = {}) {
     if (modelProb === null || modelProb < cfg.minModelProb) continue;
     if (edge === null || edge < cfg.minEdge) continue;
 
-    // Aplicar slippage al precio de entrada
-    const adjustedEntryPrice = entryPrice + cfg.slippage;
+    let adjustedEntryPrice;
+    let filled = true;
 
-    // Calcular resultado
+    if (cfg.useLimitOrders) {
+      // Limit order: place at (model fair price - discount)
+      const fairCents = (modelProb ?? 0.5) * 100;
+      const limitPx = fairCents - cfg.limitOrderDiscount;
+      adjustedEntryPrice = Math.max(1, limitPx);
+
+      if (cfg.fillRequiresCross) {
+        // Only fill if observed market price <= our limit at some snapshot
+        const laterSnaps = sorted.filter(s =>
+          new Date(s.timestamp).getTime() > new Date(snap.timestamp).getTime()
+        );
+        const marketPx = side === "UP"
+          ? laterSnaps.map(s => s.poly_up_price).filter(p => p != null)
+          : laterSnaps.map(s => s.poly_down_price).filter(p => p != null);
+        filled = marketPx.some(px => px <= adjustedEntryPrice);
+      }
+    } else {
+      adjustedEntryPrice = entryPrice + cfg.slippage;
+    }
+
+    if (!filled) continue;
+
     const won = outcome.outcome === side;
-    const exitPrice = won ? 100 : 0;  // Polymarket paga 100 si ganas, 0 si pierdes
-    
-    // PnL = (exit - entry) * contracts - comisión
-    // contracts = positionSize / entryPrice
+    const exitPrice = won ? 100 : 0;
     const contracts = cfg.positionSize / adjustedEntryPrice;
-    const grossPnl = (exitPrice - adjustedEntryPrice) * contracts / 100;  // Dividir por 100 porque precios son en centavos
+    const grossPnl = (exitPrice - adjustedEntryPrice) * contracts / 100;
     const commission = cfg.positionSize * cfg.commissionPct;
     const netPnl = grossPnl - commission;
     const pnlPct = netPnl / cfg.positionSize;
@@ -154,9 +158,9 @@ export function simulateMarket(marketSlug, config = {}) {
 /**
  * Ejecuta backtest completo sobre todos los mercados con outcome conocido.
  */
-export async function runBacktest(config = {}) {
+export function runBacktest(config = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
-  const markets = await getDistinctMarkets();
+  const markets = getDistinctMarkets();
   
   const results = {
     config: cfg,
@@ -168,7 +172,7 @@ export async function runBacktest(config = {}) {
   };
 
   for (const market of markets) {
-    const outcome = await getOutcome(market.market_slug);
+    const outcome = getOutcome(market.market_slug);
     if (!outcome) continue;  // Saltar mercados sin outcome
 
     const marketResult = simulateMarket(market.market_slug, cfg);

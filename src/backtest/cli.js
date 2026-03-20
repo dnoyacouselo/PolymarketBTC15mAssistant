@@ -12,6 +12,7 @@
  */
 
 import {
+  initDb,
   getStats,
   getDistinctMarkets,
   getAllOutcomes,
@@ -26,6 +27,7 @@ import {
   analyzeByHour,
   analyzeByDayOfWeek
 } from "./simulator.js";
+import { runRealBacktest, printBacktestReport } from "./backtestEngine.js";
 import { formatMetricsReport } from "./metrics.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -354,6 +356,33 @@ function cmdExport() {
   }
 }
 
+async function cmdRealBacktest(args) {
+  printHeader("BACKTEST REAL - Datos historicos de Binance");
+
+  try {
+    const config = { days: 30 };
+
+    for (let i = 0; i < args.length; i += 2) {
+      const key = args[i]?.replace("--", "");
+      const value = args[i + 1];
+      if (!key || !value) continue;
+
+      if (key === "days") config.days = parseInt(value);
+      else if (key === "start") config.startDate = value;
+      else if (key === "end") config.endDate = value;
+      else if (key === "timeLeft") config.simulatedTimeLeft = parseFloat(value);
+      else if (key === "lookback") config.lookback = parseInt(value);
+    }
+
+    const results = await runRealBacktest(config);
+    printBacktestReport(results);
+
+  } catch (err) {
+    printError(`Error: ${err.message}`);
+    console.error(err);
+  }
+}
+
 function cmdHelp() {
   console.log(`
 ${ANSI.bold}Polymarket BTC 15m Backtest CLI${ANSI.reset}
@@ -362,9 +391,10 @@ ${ANSI.cyan}Uso:${ANSI.reset}
   node src/backtest/cli.js <comando> [opciones]
 
 ${ANSI.cyan}Comandos:${ANSI.reset}
+  realbacktest    [NUEVO] Backtest real con datos historicos de Binance
   stats           Ver estadísticas de datos recolectados
   markets         Listar mercados con datos
-  backtest        Ejecutar backtest con configuración por defecto
+  backtest        Ejecutar backtest con datos grabados previamente
   optimize        Optimizar parámetros (prueba múltiples combinaciones)
   export          Exportar datos a CSV
   help            Mostrar esta ayuda
@@ -378,9 +408,18 @@ ${ANSI.cyan}Opciones de backtest:${ANSI.reset}
   --phases <list>     Fases permitidas (EARLY,MID,LATE)
   --strengths <list>  Strengths permitidos (STRONG,GOOD,OPTIONAL)
 
+${ANSI.cyan}Opciones de realbacktest:${ANSI.reset}
+  --days <n>          Dias de historia (default: 30)
+  --start <ISO>       Fecha inicio (ej: 2026-01-01)
+  --end <ISO>         Fecha fin (default: ahora)
+  --timeLeft <n>      Minutos restantes simulados (default: 14 = EARLY)
+  --lookback <n>      Velas de lookback para indicadores (default: 80)
+
 ${ANSI.cyan}Ejemplos:${ANSI.reset}
+  node src/backtest/cli.js realbacktest
+  node src/backtest/cli.js realbacktest --days 7
+  node src/backtest/cli.js realbacktest --start 2026-01-15 --end 2026-02-15
   node src/backtest/cli.js backtest
-  node src/backtest/cli.js backtest --minEdge 0.1 --phases MID,LATE
   node src/backtest/cli.js optimize
 `);
 }
@@ -393,6 +432,12 @@ async function main() {
   const cmdArgs = args.slice(1);
 
   try {
+    // Inicializar base de datos (solo para comandos que la usan)
+    const dbCommands = ["stats", "markets", "backtest", "bt", "optimize", "opt", "export"];
+    if (dbCommands.includes(command)) {
+      await initDb();
+    }
+
     switch (command) {
       case "stats":
         cmdStats();
@@ -403,6 +448,10 @@ async function main() {
       case "backtest":
       case "bt":
         await cmdBacktest(cmdArgs);
+        break;
+      case "realbacktest":
+      case "rbt":
+        await cmdRealBacktest(cmdArgs);
         break;
       case "optimize":
       case "opt":

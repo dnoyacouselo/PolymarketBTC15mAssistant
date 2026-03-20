@@ -1,4 +1,4 @@
-import sqlite3 from "sqlite3";
+import initSqlJs from "sql.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -6,76 +6,47 @@ const DATA_DIR = "./data";
 const DB_PATH = path.join(DATA_DIR, "backtest.db");
 
 let db = null;
+let SQL = null;
 
-function runAsync(sql, params) {
-  const d = getDb();
-  return new Promise((resolve, reject) => {
-    let adaptedParams = params;
-    if (params && !Array.isArray(params)) {
-      adaptedParams = {};
-      for (const [k, v] of Object.entries(params)) {
-        const newKey = k.startsWith('@') || k.startsWith('$') || k.startsWith(':') ? k : '@' + k;
-        adaptedParams[newKey] = v;
-      }
-    }
-
-    d.run(sql, adaptedParams, function(err) {
-      if (err) return reject(err);
-      resolve({ lastInsertRowid: this.lastID, changes: this.changes });
-    });
-  });
-}
-
-function getAsync(sql, params) {
-  const d = getDb();
-  return new Promise((resolve, reject) => {
-    let adaptedParams = params;
-    if (params && !Array.isArray(params)) {
-      adaptedParams = {};
-      for (const [k, v] of Object.entries(params)) {
-         const newKey = k.startsWith('@') || k.startsWith('$') || k.startsWith(':') ? k : '@' + k;
-         adaptedParams[newKey] = v;
-      }
-    }
-    d.get(sql, adaptedParams, (err, row) => {
-      if (err) return reject(err);
-      resolve(row);
-    });
-  });
-}
-
-function allAsync(sql, params) {
-  const d = getDb();
-  return new Promise((resolve, reject) => {
-    let adaptedParams = params;
-    if (params && !Array.isArray(params)) {
-      adaptedParams = {};
-      for (const [k, v] of Object.entries(params)) {
-         const newKey = k.startsWith('@') || k.startsWith('$') || k.startsWith(':') ? k : '@' + k;
-         adaptedParams[newKey] = v;
-      }
-    }
-    d.all(sql, adaptedParams, (err, rows) => {
-       if (err) return reject(err);
-       resolve(rows);
-    });
-  });
-}
-
-export function getDb() {
+/**
+ * Inicializa sql.js (carga WASM) y abre/crea la base de datos.
+ * Debe llamarse una vez antes de usar cualquier otra funcion.
+ */
+export async function initDb() {
   if (db) return db;
 
+  SQL = await initSqlJs();
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  db = new sqlite3.Database(DB_PATH);
-  
-  db.run("PRAGMA journal_mode = WAL");
 
+  if (fs.existsSync(DB_PATH)) {
+    const fileBuffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(fileBuffer);
+  } else {
+    db = new SQL.Database();
+  }
+
+  db.run("PRAGMA journal_mode = WAL");
   initSchema();
   return db;
 }
 
+/**
+ * Devuelve la instancia de DB (debe haberse llamado initDb antes).
+ */
+export function getDb() {
+  if (!db) throw new Error("Database not initialized. Call initDb() first.");
+  return db;
+}
+
+function saveToFile() {
+  if (!db) return;
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync(DB_PATH, buffer);
+}
+
 function initSchema() {
-  const schema = `
+  db.run(`
     CREATE TABLE IF NOT EXISTS snapshots (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       timestamp TEXT NOT NULL,
@@ -114,11 +85,13 @@ function initSchema() {
       phase TEXT,
       strength TEXT,
       created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON snapshots(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_snapshots_market_slug ON snapshots(market_slug);
-    CREATE INDEX IF NOT EXISTS idx_snapshots_signal ON snapshots(signal);
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON snapshots(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_snapshots_market_slug ON snapshots(market_slug)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_snapshots_signal ON snapshots(signal)`);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS market_outcomes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       market_slug TEXT UNIQUE NOT NULL,
@@ -127,10 +100,12 @@ function initSchema() {
       final_price REAL,
       outcome TEXT,
       resolved_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_outcomes_slug ON market_outcomes(market_slug);
-    CREATE INDEX IF NOT EXISTS idx_outcomes_outcome ON market_outcomes(outcome);
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_outcomes_slug ON market_outcomes(market_slug)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_outcomes_outcome ON market_outcomes(outcome)`);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS simulated_trades (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       market_slug TEXT NOT NULL,
@@ -148,20 +123,49 @@ function initSchema() {
       pnl_pct REAL,
       resolved_at TEXT,
       created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_trades_market ON simulated_trades(market_slug);
-    CREATE INDEX IF NOT EXISTS idx_trades_outcome ON simulated_trades(outcome);
-  `;
-  
-  db.exec(schema, (err) => {
-      if (err) console.error("Schema init error:", err);
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_trades_market ON simulated_trades(market_slug)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_trades_outcome ON simulated_trades(outcome)`);
+
+  saveToFile();
+}
+
+// Helper para convertir resultado de sql.js a array de objetos
+function rowsToObjects(result) {
+  if (!result || result.length === 0) return [];
+  const stmt = result[0];
+  return stmt.values.map(row => {
+    const obj = {};
+    stmt.columns.forEach((col, i) => { obj[col] = row[i]; });
+    return obj;
   });
+}
+
+function queryAll(sql, params = []) {
+  try {
+    const result = db.exec(sql, params);
+    return rowsToObjects(result);
+  } catch {
+    return [];
+  }
+}
+
+function queryGet(sql, params = []) {
+  const rows = queryAll(sql, params);
+  return rows.length > 0 ? rows[0] : undefined;
+}
+
+function runSql(sql, params = []) {
+  db.run(sql, params);
+  saveToFile();
+  return { lastInsertRowid: db.exec("SELECT last_insert_rowid()")[0]?.values[0]?.[0] ?? 0 };
 }
 
 // ==================== SNAPSHOTS ====================
 
 export function insertSnapshot(data) {
-  return runAsync(`
+  return runSql(`
     INSERT INTO snapshots (
       timestamp, market_slug, market_end_time,
       chainlink_price, binance_price, price_to_beat,
@@ -173,21 +177,31 @@ export function insertSnapshot(data) {
       regime, time_left_min, model_up, model_down, edge_up, edge_down,
       signal, phase, strength
     ) VALUES (
-      @timestamp, @market_slug, @market_end_time,
-      @chainlink_price, @binance_price, @price_to_beat,
-      @poly_up_price, @poly_down_price, @poly_liquidity,
-      @poly_up_bid_liq, @poly_up_ask_liq, @poly_down_bid_liq, @poly_down_ask_liq,
-      @rsi, @rsi_slope, @macd_line, @macd_signal, @macd_hist, @macd_hist_delta,
-      @vwap, @vwap_slope, @vwap_dist, @heiken_color, @heiken_count,
-      @delta_1m, @delta_3m,
-      @regime, @time_left_min, @model_up, @model_down, @edge_up, @edge_down,
-      @signal, @phase, @strength
+      ?, ?, ?,
+      ?, ?, ?,
+      ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?,
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?
     )
-  `, data);
+  `, [
+    data.timestamp, data.market_slug, data.market_end_time,
+    data.chainlink_price, data.binance_price, data.price_to_beat,
+    data.poly_up_price, data.poly_down_price, data.poly_liquidity,
+    data.poly_up_bid_liq, data.poly_up_ask_liq, data.poly_down_bid_liq, data.poly_down_ask_liq,
+    data.rsi, data.rsi_slope, data.macd_line, data.macd_signal, data.macd_hist, data.macd_hist_delta,
+    data.vwap, data.vwap_slope, data.vwap_dist, data.heiken_color, data.heiken_count,
+    data.delta_1m, data.delta_3m,
+    data.regime, data.time_left_min, data.model_up, data.model_down, data.edge_up, data.edge_down,
+    data.signal, data.phase, data.strength
+  ]);
 }
 
 export function getSnapshotsByMarket(marketSlug) {
-  return allAsync(`
+  return queryAll(`
     SELECT * FROM snapshots 
     WHERE market_slug = ? 
     ORDER BY timestamp ASC
@@ -195,7 +209,7 @@ export function getSnapshotsByMarket(marketSlug) {
 }
 
 export function getSnapshotsInRange(startTime, endTime) {
-  return allAsync(`
+  return queryAll(`
     SELECT * FROM snapshots 
     WHERE timestamp >= ? AND timestamp <= ?
     ORDER BY timestamp ASC
@@ -203,7 +217,7 @@ export function getSnapshotsInRange(startTime, endTime) {
 }
 
 export function getDistinctMarkets() {
-  return allAsync(`
+  return queryAll(`
     SELECT DISTINCT market_slug, market_end_time, 
            MIN(timestamp) as first_seen,
            MAX(timestamp) as last_seen,
@@ -212,7 +226,7 @@ export function getDistinctMarkets() {
     WHERE market_slug IS NOT NULL
     GROUP BY market_slug
     ORDER BY market_end_time DESC
-  `); 
+  `);
 }
 
 export function getSignalSnapshots(options = {}) {
@@ -223,53 +237,47 @@ export function getSignalSnapshots(options = {}) {
 
   if (signal) {
     query += ` AND signal = ?`;
-    params.push(processParam(signal));
+    params.push(signal);
   }
   if (minEdge !== undefined) {
     query += ` AND (edge_up >= ? OR edge_down >= ?)`;
-    params.push(processParam(minEdge), processParam(minEdge));
+    params.push(minEdge, minEdge);
   }
   if (phase) {
     query += ` AND phase = ?`;
-    params.push(processParam(phase));
+    params.push(phase);
   }
 
   query += ` ORDER BY timestamp DESC`;
 
   if (limit) {
     query += ` LIMIT ?`;
-    params.push(processParam(limit));
+    params.push(limit);
   }
 
-  return allAsync(query, params);
-}
-
-function processParam(p) {
-    return p;
+  return queryAll(query, params);
 }
 
 // ==================== OUTCOMES ====================
 
 export function insertOutcome(data) {
-  return runAsync(`
+  return runSql(`
     INSERT OR REPLACE INTO market_outcomes (
       market_slug, market_end_time, price_to_beat, final_price, outcome
-    ) VALUES (
-      @market_slug, @market_end_time, @price_to_beat, @final_price, @outcome
-    )
-  `, data);
+    ) VALUES (?, ?, ?, ?, ?)
+  `, [data.market_slug, data.market_end_time, data.price_to_beat, data.final_price, data.outcome]);
 }
 
 export function getOutcome(marketSlug) {
-  return getAsync(`SELECT * FROM market_outcomes WHERE market_slug = ?`, [marketSlug]);
+  return queryGet(`SELECT * FROM market_outcomes WHERE market_slug = ?`, [marketSlug]);
 }
 
 export function getAllOutcomes() {
-  return allAsync(`SELECT * FROM market_outcomes ORDER BY resolved_at DESC`);
+  return queryAll(`SELECT * FROM market_outcomes ORDER BY resolved_at DESC`);
 }
 
 export function getPendingOutcomes() {
-  return allAsync(`
+  return queryAll(`
     SELECT DISTINCT s.market_slug, s.market_end_time, s.price_to_beat
     FROM snapshots s
     LEFT JOIN market_outcomes o ON s.market_slug = o.market_slug
@@ -284,33 +292,31 @@ export function getPendingOutcomes() {
 // ==================== SIMULATED TRADES ====================
 
 export function insertSimulatedTrade(data) {
-  return runAsync(`
+  return runSql(`
     INSERT INTO simulated_trades (
       market_slug, entry_timestamp, entry_price, side, size,
       model_prob, edge, phase, strength
-    ) VALUES (
-      @market_slug, @entry_timestamp, @entry_price, @side, @size,
-      @model_prob, @edge, @phase, @strength
-    )
-  `, data);
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    data.market_slug, data.entry_timestamp, data.entry_price, data.side, data.size,
+    data.model_prob, data.edge, data.phase, data.strength
+  ]);
 }
 
 export function resolveSimulatedTrade(id, result) {
-  return runAsync(`
+  runSql(`
     UPDATE simulated_trades SET
-      exit_price = @exit_price,
-      outcome = @outcome,
-      pnl = @pnl,
-      pnl_pct = @pnl_pct,
+      exit_price = ?,
+      outcome = ?,
+      pnl = ?,
+      pnl_pct = ?,
       resolved_at = datetime('now')
-    WHERE id = @id
-  `, { id, ...result });
+    WHERE id = ?
+  `, [result.exit_price, result.outcome, result.pnl, result.pnl_pct, id]);
 }
 
 export function getUnresolvedTrades() {
-  return allAsync(`
-    SELECT * FROM simulated_trades WHERE outcome IS NULL
-  `);
+  return queryAll(`SELECT * FROM simulated_trades WHERE outcome IS NULL`);
 }
 
 export function getAllTrades(options = {}) {
@@ -324,63 +330,38 @@ export function getAllTrades(options = {}) {
   } else if (resolved === false) {
     query += ` WHERE outcome IS NULL`;
   }
-  
+
   if (limit) {
-      query += ` LIMIT ?`;
-      params.push(limit);
+    query += ` LIMIT ?`;
+    params.push(limit);
   }
-  return allAsync(query, params);
+  return queryAll(query, params);
 }
 
-export async function getStats() {
-  try {
-    const snapshotResult = await getAsync(`SELECT COUNT(*) as count FROM snapshots`);
-    const snapshotCount = snapshotResult?.count || 0;
+export function getStats() {
+  const snapshotCount = queryGet(`SELECT COUNT(*) as count FROM snapshots`)?.count || 0;
+  const marketCount = queryGet(`SELECT COUNT(DISTINCT market_slug) as count FROM snapshots WHERE market_slug IS NOT NULL`)?.count || 0;
+  const outcomeCount = queryGet(`SELECT COUNT(*) as count FROM market_outcomes`)?.count || 0;
+  const tradeCount = queryGet(`SELECT COUNT(*) as count FROM simulated_trades`)?.count || 0;
+  const resolvedTradeCount = queryGet(`SELECT COUNT(*) as count FROM simulated_trades WHERE outcome IS NOT NULL`)?.count || 0;
+  const firstSnapshot = queryGet(`SELECT MIN(timestamp) as first_ts FROM snapshots`)?.first_ts || null;
+  const lastSnapshot = queryGet(`SELECT MAX(timestamp) as last_ts FROM snapshots`)?.last_ts || null;
 
-    const marketResult = await getAsync(`SELECT COUNT(DISTINCT market_slug) as count FROM snapshots WHERE market_slug IS NOT NULL`);
-    const marketCount = marketResult?.count || 0;
-
-    const outcomeResult = await getAsync(`SELECT COUNT(*) as count FROM market_outcomes`);
-    const outcomeCount = outcomeResult?.count || 0;
-
-    const tradeResult = await getAsync(`SELECT COUNT(*) as count FROM simulated_trades`);
-    const tradeCount = tradeResult?.count || 0;
-
-    const resolvedResult = await getAsync(`SELECT COUNT(*) as count FROM simulated_trades WHERE outcome IS NOT NULL`);
-    const resolvedTradeCount = resolvedResult?.count || 0;
-
-    const firstResult = await getAsync(`SELECT MIN(timestamp) as first_ts FROM snapshots`);
-    const firstSnapshot = firstResult?.first_ts || null;
-
-    const lastResult = await getAsync(`SELECT MAX(timestamp) as last_ts FROM snapshots`);
-    const lastSnapshot = lastResult?.last_ts || null;
-
-    return {
-      snapshotCount,
-      marketCount,
-      outcomeCount,
-      tradeCount,
-      resolvedTradeCount,
-      firstSnapshot,
-      lastSnapshot
-    };
-  } catch (err) {
-    console.error("Error getting stats:", err);
-    return {
-      snapshotCount: 0,
-      marketCount: 0,
-      outcomeCount: 0,
-      tradeCount: 0,
-      resolvedTradeCount: 0,
-      firstSnapshot: null,
-      lastSnapshot: null
-    };
-  }
+  return {
+    snapshotCount,
+    marketCount,
+    outcomeCount,
+    tradeCount,
+    resolvedTradeCount,
+    firstSnapshot,
+    lastSnapshot
+  };
 }
 
 export function closeDb() {
-    if (db) {
-        db.close();
-        db = null;
-    }
+  if (db) {
+    saveToFile();
+    db.close();
+    db = null;
+  }
 }
